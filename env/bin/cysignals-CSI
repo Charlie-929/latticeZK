@@ -1,0 +1,240 @@
+#!/Users/suhuangyuan/latticeZK/env/bin/python
+#*****************************************************************************
+#       Copyright (C) 2013 Volker Braun <vbraun.name@gmail.com>
+#
+#  cysignals is free software: you can redistribute it and/or modify it
+#  under the terms of the GNU Lesser General Public License as published
+#  by the Free Software Foundation, either version 3 of the License, or
+#  (at your option) any later version.
+#
+#  cysignals is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU Lesser General Public License for more details.
+#
+#  You should have received a copy of the GNU Lesser General Public License
+#  along with cysignals.  If not, see <http://www.gnu.org/licenses/>.
+#
+#*****************************************************************************
+
+from __future__ import print_function
+
+description = """
+    Attach the debugger to a Python process (given by its pid) and
+    extract as much information about its internal state as possible
+    without any user interaction. The target process is frozen while
+    this script runs and resumes when it is finished."""
+
+# A backtrace is saved in the directory $CYSIGNALS_CRASH_LOGS, which is
+# cysignals_crash_logs by default.  Any backtraces older than
+# $CYSIGNALS_CRASH_DAYS (default: 7 if CYSIGNALS_CRASH_LOGS unset, -1 if
+# set) are automatically deleted, but with a negative value they are
+# never deleted.
+
+import sys
+import os
+from subprocess import Popen, PIPE
+import signal
+import tempfile
+import sysconfig
+import site
+
+from argparse import ArgumentParser
+from datetime import datetime
+from distutils.spawn import find_executable
+
+
+def b(x):
+    """
+    Convert `x` (either a ``str`` or ``bytes``) to ``bytes``, assuming
+    ASCII encoding.
+    """
+    if isinstance(x, bytes):
+        return x
+    return bytes(x, "ascii")
+
+
+def pid_exists(pid):
+    """
+    Return True if and only if there is a process with id pid running.
+    """
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def gdb_commands(pid, color):
+    cmds = b('')
+    cmds += b('set prompt (cysignals-gdb-prompt)\n')
+    cmds += b('set verbose off\n')
+    cmds += b('attach {0}\n'.format(pid))
+    cmds += b('python\n')
+    cmds += b('print("\\n")\n')
+    cmds += b('print("Stack backtrace")\n')
+    cmds += b('print("---------------")\n')
+    cmds += b('import sys; sys.stdout.flush()\n')
+    cmds += b('end\n')
+    cmds += b('bt full\n')
+    cysignals_share = os.path.join(os.path.dirname(sys.argv[0]), '..',
+                                   'share', 'cysignals')
+    script = os.path.join(cysignals_share, 'cysignals-CSI-helper.py')
+    with open(script, 'r') as f:
+        cmds += b('python\n')
+        cmds += b('color = {0!r}; '.format(color))
+        cmds += b('sys_path = {0!r}; '.format(sys.path))
+        cmds += b(f.read())
+        cmds += b('end\n')
+    cmds += b('detach inferior 1\n')
+    cmds += b('quit\n')
+    return cmds
+
+
+def run_gdb(pid, color):
+    """
+    Execute gdb.
+    """
+    whichgdb = find_executable('gdb')
+    if whichgdb is None:
+        return b"Cannot find gdb installed"
+
+    env = dict(os.environ)
+    try:
+        cmd = Popen(["gdb"], executable=whichgdb,
+                stdin=PIPE, stdout=PIPE, stderr=PIPE, env=env)
+    except OSError:
+        return b"Unable to start gdb (not installed?)"
+
+    try:
+        stdout, stderr = cmd.communicate(gdb_commands(pid, color))
+    except BaseException:
+        # Something went wrong => kill gdb
+        cmd.kill()
+        raise
+
+    result = []
+    for line in stdout.splitlines():
+        if line.find(b"(cysignals-gdb-prompt)") >= 0:
+            continue
+        if line.startswith(b"Reading symbols from "):
+            continue
+        if line.startswith(b"Loaded symbols for "):
+            continue
+        result.append(line)
+    result.append(stderr)
+    if cmd.wait() != 0:
+        result.append(b"Failed to run gdb.")
+
+    return b'\n'.join(result)
+
+
+def mkdir_p(path):
+    try:
+        os.makedirs(path)
+    except OSError as e:
+        if not os.path.isdir(path):
+            raise
+
+
+def prune_old_logs(directory, days):
+    """
+    Delete all files in ``directory`` that are older than a given
+    number of days.
+    """
+    for filename in os.listdir(directory):
+        filename = os.path.join(directory, filename)
+        mtime = datetime.utcfromtimestamp(os.path.getmtime(filename))
+        age = datetime.utcnow() - mtime
+        if age.days >= days:
+            try:
+                os.unlink(filename)
+            except OSError:
+                pass
+
+
+def save_backtrace(output):
+    try:
+        bt_dir = os.environ['CYSIGNALS_CRASH_LOGS']
+        # Don't delete all files in this directory, in case the user
+        # set CYSIGNALS_CRASH_LOGS to a stupid value.
+        bt_days = -1
+    except KeyError:
+        bt_dir = 'cysignals_crash_logs'
+        bt_days = 7
+
+    if not bt_dir:
+        return None
+
+    try:
+        bt_days = int(os.environ['CYSIGNALS_CRASH_DAYS'])
+    except KeyError:
+        pass
+
+    mkdir_p(bt_dir)
+    if bt_days >= 0:
+        prune_old_logs(bt_dir, bt_days)
+    f, filename = tempfile.mkstemp(dir=bt_dir, prefix='crash_', suffix='.log')
+    os.write(f, output)
+    os.close(f)
+    return filename
+
+
+def main(args):
+    print('Attaching gdb to process id {0}.'.format(args.pid))
+    sys.stdout.flush()
+    trace = run_gdb(args.pid, not args.nocolor)
+    os.write(1, trace)
+
+    fatalities = [
+        (b'Cannot find gdb',
+         'GDB is not installed.'),
+        (b'Unable to start gdb',
+         'GDB is not installed.'),
+        (b'Hangup detected on fd 0',
+         'Your system GDB is an old version that does not work with pipes.'),
+        (b'error detected on stdin',
+         'Your system GDB does not have Python support.'),
+        (b'ImportError: No module named',
+         'Your system GDB uses an incompatible version of Python.'),
+        (b'Failed to run gdb', 'Failed to run gdb.'),
+    ]
+
+    for key, msg in fatalities:
+        if key in trace:
+            print()
+            print(msg)
+            print('Install gdb for enhanced tracebacks.')
+            return
+
+    filename = save_backtrace(trace)
+    if filename is not None:
+        print('Saved trace to {0}'.format(filename))
+
+
+if __name__ == '__main__':
+    parser = ArgumentParser(description=description)
+    parser.add_argument('-p', '--pid', dest='pid', action='store',
+                        default=None, type=int,
+                        help='the pid to attach to.')
+    parser.add_argument('-nc', '--no-color', dest='nocolor', action='store_true',
+                        default=False,
+                        help='turn off syntax-highlighting.')
+    parser.add_argument('-k', '--kill', dest='kill', action='store_true',
+                        default=False,
+                        help='kill after inspection is finished.')
+    args = parser.parse_args()
+
+    if args.pid is None:
+        parser.print_help()
+        sys.exit(0)
+
+    if not pid_exists(args.pid):
+        print('There is no process with pid {0}.'.format(args.pid))
+        sys.exit(1)
+
+    try:
+        main(args)
+    finally:
+        if args.kill:
+            os.kill(args.pid, signal.SIGKILL)

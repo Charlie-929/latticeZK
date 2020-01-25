@@ -1,0 +1,10 @@
+prefix=/Users/suhuangyuan/latticeZK/env
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: fplll
+Description: lattice algorithms with floating-point computations
+Version: 5.3.2
+Cflags: -pthread
+Libs: -L${libdir} -lqd -lgmp  -lmpfr -lfplll
